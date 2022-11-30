@@ -1,0 +1,18 @@
+Channel composition after padding:
+
+H1 2
+H2 1
+H4 1
+H6 1
+V1 2
+V4 1
+
+Active dimensions: 7464 X 16896 nm
+Metal dimensions: 4800 X 11200 nm
+
+Multiplexer sizes:
+
+12: H1_L_0 H1_L_1 H1_R_0 H1_R_1 cb_out_0 cb_out_1 cb_out_2 cb_out_3
+13: H2_L_0 H2_R_0 H4_L_0 H4_R_0 H6_L_0 H6_R_0
+14: V1_D_0_tap_0 V1_D_1_tap_0 V1_U_0_tap_0 V1_U_1_tap_0
+15: V4_D_0_tap_0 V4_U_0_tap_0

@@ -1,0 +1,1 @@
+K6N16D0.50R0X0Y0T16.log changed from (5, 25) to (5, 24) to avoid oscillations when measuring connection-block output delay.

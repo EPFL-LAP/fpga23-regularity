@@ -1,0 +1,1950 @@
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/libs/libarchfpga/src/physical_types.h vtr8_avalanche/libs/libarchfpga/src/physical_types.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/libs/libarchfpga/src/physical_types.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/libs/libarchfpga/src/physical_types.h	2022-11-30 23:03:45.957634000 +0100
+@@ -1199,6 +1199,9 @@
+     enum e_directionality directionality;
+     std::vector<bool> cb;
+     std::vector<bool> sb;
++    int prev_usage; //SN: Used to calculate the differential term of the avalanche cost reduction.
++    int usage; //SN: Added to track usage of potential edges.
++    int historical_usage; //SN: Historical term of the avalanche costs.
+     //float Cmetal_per_m; /* Wire capacitance (per meter) */
+ };
+ 
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/libs/README.md vtr8_avalanche/libs/README.md
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/libs/README.md	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/libs/README.md	1970-01-01 01:00:00.000000000 +0100
+@@ -1,5 +0,0 @@
+-This directory contains common utility libraries used by VTR.
+-
+-Libraries included under the EXTERNAL/ directory are developed outside of the VTR repository and are included for convienience.
+-
+-EXTERNAL libaries should not be modified in the VTR source tree because it will diverge from their mainline implementations.
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/read_options.cpp vtr8_avalanche/vpr/src/base/read_options.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/read_options.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/base/read_options.cpp	2022-11-30 23:03:49.334602000 +0100
+@@ -1285,6 +1285,14 @@
+         .default_value("min")
+         .show_in(argparse::ShowIn::HELP_ONLY);
+ 
++    place_timing_grp.add_argument(args.import_place_delay_model, "--import_place_delay_model")
++        .help(
++            "Specify a file that holds the placement delay model to be loaded.\n"
++            "Each line holds an integer representing the number of picoseconds delay at the given offset.\n"
++            "Row-major storage of the matrix is assumed.")
++        .default_value("")
++        .show_in(argparse::ShowIn::HELP_ONLY);
++
+     place_timing_grp.add_argument(args.place_delay_offset, "--place_delay_offset")
+         .help(
+             "A constant offset (in seconds) applied to the placer's delay model.")
+@@ -1326,6 +1334,18 @@
+ 
+     auto& route_grp = parser.add_argument_group("routing options");
+ 
++    //SN: Add a random seed passing option for net shuffling.
++    route_grp.add_argument(args.random_sort_nets, "--random_sort_nets")
++        .help("Specifies that the nets should be sorted using std::random_shuffle when being reouted.)")
++        .default_value("false")
++        .show_in(argparse::ShowIn::HELP_ONLY);
++
++    route_grp.add_argument(args.random_sort_nets_seed, "--random_sort_nets_seed")
++        .help("Specifies the random seed for the net sorter.)")
++        .default_value("0")
++        .show_in(argparse::ShowIn::HELP_ONLY);
++
++
+     route_grp.add_argument(args.max_router_iterations, "--max_router_iterations")
+         .help(
+             "Maximum number of Pathfinder-based routing iterations before the circuit is"
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/read_options.h vtr8_avalanche/vpr/src/base/read_options.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/read_options.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/base/read_options.h	2022-11-30 23:03:49.346624000 +0100
+@@ -94,6 +94,7 @@
+     argparse::ArgValue<int> inner_loop_recompute_divider;
+     argparse::ArgValue<float> place_exp_first;
+     argparse::ArgValue<float> place_exp_last;
++    argparse::ArgValue<std::string> import_place_delay_model;
+     argparse::ArgValue<float> place_delay_offset;
+     argparse::ArgValue<int> place_delay_ramp_delta_threshold;
+     argparse::ArgValue<float> place_delay_ramp_slope;
+@@ -109,6 +110,11 @@
+     argparse::ArgValue<float> initial_pres_fac;
+     argparse::ArgValue<float> pres_fac_mult;
+     argparse::ArgValue<float> acc_fac;
++
++    //SN: Add random seed passing option for net shuffling.
++    argparse::ArgValue<bool> random_sort_nets;
++    argparse::ArgValue<int> random_sort_nets_seed;
++
+     argparse::ArgValue<int> bb_factor;
+     argparse::ArgValue<e_base_cost_type> base_cost_type;
+     argparse::ArgValue<float> bend_cost;
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/SetupVPR.cpp vtr8_avalanche/vpr/src/base/SetupVPR.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/SetupVPR.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/base/SetupVPR.cpp	2022-11-30 23:03:48.919645000 +0100
+@@ -312,6 +312,10 @@
+ 
+     RouterOpts->full_stats = Options.full_stats;
+ 
++    //SN: Adds an option to pass a seed for random net-shuffling.
++    RouterOpts->random_sort_nets = Options.random_sort_nets;
++    RouterOpts->random_sort_nets_seed = Options.random_sort_nets_seed;
++
+     //TODO document these?
+     RouterOpts->congestion_analysis = Options.full_stats;
+     RouterOpts->fanout_analysis = Options.full_stats;
+@@ -460,6 +464,7 @@
+     /* Depends on PlacerOpts->place_algorithm */
+     PlacerOpts->enable_timing_computations = Options.ShowPlaceTiming;
+ 
++    PlacerOpts->import_delay_model = Options.import_place_delay_model;
+     PlacerOpts->delay_offset = Options.place_delay_offset;
+     PlacerOpts->delay_ramp_delta_threshold = Options.place_delay_ramp_delta_threshold;
+     PlacerOpts->delay_ramp_slope = Options.place_delay_ramp_slope;
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/stats.cpp vtr8_avalanche/vpr/src/base/stats.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/stats.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/base/stats.cpp	2022-11-30 23:03:49.429611000 +0100
+@@ -287,6 +287,7 @@
+     tptr = prevptr->next;
+ 
+     while (tptr != nullptr) {
++        //VTR_LOG("inode = %d\n", inode);
+         inode = tptr->index;
+         curr_type = device_ctx.rr_nodes[inode].type();
+ 
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/vpr_context.h vtr8_avalanche/vpr/src/base/vpr_context.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/vpr_context.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/base/vpr_context.h	2022-11-30 23:03:49.465600000 +0100
+@@ -154,9 +154,42 @@
+ 
+     std::vector<t_rr_switch_inf> rr_switch_inf; /* autogenerated in build_rr_graph based on switch fan-in. [0..(num_rr_switches-1)] */
+ 
++    int num_arch_segs;
++    t_segment_inf* arch_seg_inf; //SN: Globally stores segment information.
+     int num_arch_switches;
+     t_arch_switch_inf* arch_switch_inf; /* [0..(num_arch_switches-1)] */
+ 
++    int has_potential_switches;
++
++    int freeze_avalanche;
++    int ripup_all;
++    float avalanche_p;
++    float avalanche_h; 
++    float avalanche_d; 
++    int avalanche_iter_to_zero;
++    float reset_cost;
++
++    float wire_lookahead_weight;
++    float base_cost_scale;
++    float min_base_cost;
++    float crit_scale;
++    float max_criticality;
++    //float edge_splitter_crit_breakpoint = 0.99;
++    float edge_splitter_crit_exp;// = 8.0; //Exponent for net criticality when computing the perceived edge-splitter cost.
++    float target_critical_splitter_cost;// = 1e-12;
++    float M;// = -1.0; //0.9227456944279201; //Holds the base value from whcih exponentiated criticality
++                                        //is subtracted when computing the edge-splitter cost.
++                                        //This value was computed manually for max_crit = 0.99 and exp = 8, so that for the maximum
++                                        //criticality, the cost drops to ~1e-13. Change as needed.
++    int boost_lookahead;//Specifies that the edge-splitter nodes' lookahead should be boosted.
++    float lookahead_boost_factor;//This is set to the invers of the base cost scaling factor, when reading in the base costs.
++
++    float max_cong_cost; //SN: Tracks the maximum congestion cost. Needed for cost
++                         //    normalization of edge splitters, when routing timing-
++                         //    critical edges.
++                         //
++    int is_reset_iter; //Tells that we are in the base cost reset regime (first routing iteration).
++
+     // Clock Newtworks
+     std::vector<std::unique_ptr<ClockNetwork>> clock_networks;
+     std::vector<std::unique_ptr<ClockConnection>> clock_connections;
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/vpr_types.h vtr8_avalanche/vpr/src/base/vpr_types.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/base/vpr_types.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/base/vpr_types.h	2022-11-30 23:03:49.514597000 +0100
+@@ -807,6 +807,7 @@
+     PlaceDelayModelType delay_model_type;
+     e_reducer delay_model_reducer;
+ 
++    std::string import_delay_model;
+     float delay_offset;
+     int delay_ramp_delta_threshold;
+     float delay_ramp_slope;
+@@ -913,6 +914,11 @@
+     float initial_pres_fac;
+     float pres_fac_mult;
+     float acc_fac;
++
++    //SN: Random net shuffling options.
++    bool random_sort_nets = false;
++    int random_sort_nets_seed = 0;
++
+     float bend_cost;
+     int max_router_iterations;
+     int min_incremental_reroute_fanout;
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/draw/draw.cpp vtr8_avalanche/vpr/src/draw/draw.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/draw/draw.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/draw/draw.cpp	2022-11-30 23:03:49.545608000 +0100
+@@ -1771,12 +1771,13 @@
+         if (device_ctx.rr_nodes[to_node].direction() != BI_DIRECTION) {
+             /* must connect to to_node's wire beginning at x2 */
+             if (to_track % 2 == 0) { /* INC wire starts at leftmost edge */
+-                VTR_ASSERT(from_xlow < to_xlow);
++                printf("%d -> %d\n", from_node, to_node);
++                //VTR_ASSERT(from_xlow < to_xlow);
+                 x2 = to_chan.left();
+                 /* since no U-turns from_track must be INC as well */
+                 x1 = draw_coords->tile_x[to_xlow - 1] + draw_coords->get_tile_width();
+             } else { /* DEC wire starts at rightmost edge */
+-                VTR_ASSERT(from_xhigh > to_xhigh);
++                //VTR_ASSERT(from_xhigh > to_xhigh);
+                 x2 = to_chan.right();
+                 x1 = draw_coords->tile_x[to_xhigh + 1];
+             }
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/place/timing_place_lookup.cpp vtr8_avalanche/vpr/src/place/timing_place_lookup.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/place/timing_place_lookup.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/place/timing_place_lookup.cpp	2022-11-30 23:03:50.222559000 +0100
+@@ -81,6 +81,8 @@
+                                    t_router_opts router_opts,
+                                    bool measure_directconnect);
+ 
++static vtr::Matrix<float> import_delta_delay_model(const std::string filepath);
++
+ static vtr::Matrix<float> compute_delta_delays(const t_placer_opts& palcer_opts, const t_router_opts& router_opts, bool measure_directconnect, size_t longest_length);
+ 
+ float delay_reduce(std::vector<float>& delays, e_reducer reducer);
+@@ -122,6 +124,12 @@
+                                                            const int num_directs) {
+     vtr::ScopedStartFinishTimer timer("Computing placement delta delay look-up");
+ 
++    if (strcmp(placer_opts.import_delay_model.c_str(), "")) {
++        auto delta_delays = import_delta_delay_model(placer_opts.import_delay_model);
++
++        return std::make_unique<DeltaDelayModel>(std::move(delta_delays), router_opts);
++    }
++
+     init_placement_context();
+ 
+     t_chan_width chan_width = setup_chan_width(router_opts, chan_width_dist);
+@@ -235,6 +243,8 @@
+ static float route_connection_delay(int source_x, int source_y, int sink_x, int sink_y, t_router_opts router_opts, bool measure_directconnect) {
+     //Routes between the source and sink locations and calculates the delay
+ 
++    //printf("Routing from (%d, %d) to (%d, %d)\n\n\n", source_x, source_y, sink_x, sink_y);
++
+     float net_delay_value = IMPOSSIBLE_DELTA; /*set to known value for debug purposes */
+ 
+     auto& device_ctx = g_vpr_ctx.device();
+@@ -278,6 +288,8 @@
+                      source_x, source_y, sink_x, sink_y, net_delay_value);
+     }
+ 
++    //printf("delay = %g\n", net_delay_value);
++
+     return (net_delay_value);
+ }
+ 
+@@ -617,6 +629,32 @@
+ 
+     return delta_delays;
+ }
++
++//SN: Loads a delta matrix from a file. All values are assumed to be in ps.
++static vtr::Matrix<float> import_delta_delay_model(const std::string filepath) {
++    vtr::ScopedStartFinishTimer timer("Importing delta delays");
++
++    auto& device_ctx = g_vpr_ctx.device();
++    auto& grid = device_ctx.grid;
++    vtr::Matrix<float> delta_delays({grid.width(), grid.height()});
++
++    int words_read = 0;
++    FILE* f = vtr::fopen(filepath.c_str(), "r");
++    VTR_ASSERT(f != NULL);
++
++    for (size_t dy = 0; dy < delta_delays.dim_size(1); ++dy) {
++        for (size_t dx = 0; dx < delta_delays.dim_size(0); ++dx) {
++            words_read = fscanf(f, "%f", &(delta_delays[dx][dy]));
++            VTR_ASSERT(words_read);
++            if (delta_delays[dx][dy] < 0)
++                delta_delays[dx][dy] = IMPOSSIBLE_DELTA;
++            else
++                delta_delays[dx][dy] *= 1e-12;
++        }
++    }
++
++    return delta_delays;
++}
+ 
+ //Finds a src_rr and sink_rr appropriate for measuring the delay of the current direct specification
+ static bool find_direct_connect_sample_locations(const t_direct_inf* direct,
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_common.cpp vtr8_avalanche/vpr/src/route/route_common.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_common.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/route_common.cpp	2022-11-30 23:03:50.586587000 +0100
+@@ -245,7 +245,7 @@
+ }
+ 
+ bool try_route(int width_fac,
+-               const t_router_opts& router_opts,
++               t_router_opts& router_opts,
+                const t_analysis_opts& analysis_opts,
+                t_det_routing_arch* det_routing_arch,
+                std::vector<t_segment_inf>& segment_inf,
+@@ -425,10 +425,109 @@
+      * ONE MORE net use this routing node.     */
+ 
+     auto& route_ctx = g_vpr_ctx.mutable_routing();
+-    auto& device_ctx = g_vpr_ctx.device();
++    auto& device_ctx = g_vpr_ctx.mutable_device();
++
++    auto& node = device_ctx.rr_nodes[inode];
+ 
++    int prev_occ = route_ctx.rr_node_route_inf[inode].occ();
+     int occ = route_ctx.rr_node_route_inf[inode].occ() + add_or_sub;
+     route_ctx.rr_node_route_inf[inode].set_occ(occ);
++    if (node.is_edge_splitter())
++    {
++        int cost_index = node.cost_index();
++        int seg_index = device_ctx.rr_indexed_data[cost_index].seg_index;
++
++        route_ctx.rr_node_route_inf[inode].pres_cost = 1.0;
++
++        /*
++        int xlow = device_ctx.rr_nodes[inode].xlow();
++        int ylow = device_ctx.rr_nodes[inode].ylow();
++        int xhigh = device_ctx.rr_nodes[inode].xhigh();
++        int yhigh = device_ctx.rr_nodes[inode].yhigh();
++
++        const int IO_BOUNDARY_USAGE_FILTER = 1;
++        //NOTE: If any of the locations within a ball of this radius centered at (xlow, ylow) is not a CLB
++        //      we don't consider its usage. This is to avoid the effect of cropped boundary wires and IPs
++        //      if they exist (which is for now not the case).
++        int xmin = std::max(0, xlow - IO_BOUNDARY_USAGE_FILTER);
++        int xmax = std::min(xhigh + IO_BOUNDARY_USAGE_FILTER, (int)(device_ctx.grid.width()));
++        int ymin = std::max(0, ylow - IO_BOUNDARY_USAGE_FILTER);
++        int ymax = std::min(yhigh + IO_BOUNDARY_USAGE_FILTER, (int)(device_ctx.grid.height()));
++        printf("%d, %d; %d, %d\n", xmin, xmax, ymin, ymax);
++        char tmp;
++        scanf("%c", &tmp);
++
++        int is_clb = 1;
++        for (int x = xmin; x < xmax; ++x)
++        {
++            for (int y = ymin; y < ymax; ++y)
++            {
++                if (strcmp("clb", device_ctx.grid[x][y].type -> name))
++                {
++                    is_clb = 0;
++                    break;
++                }
++                if (!is_clb)
++                    break;
++            }
++        }
++
++        is_clb = 1;
++        //NOTE: This will not discard any utilizations and thus guarantee routability.
++
++        if (is_clb)
++        {*/
++
++        if ((prev_occ == 0) && (occ > 0))
++        {
++            device_ctx.arch_seg_inf[seg_index].usage += 1;
++        }
++        else if ((prev_occ > 0) && (occ == 0))
++        {
++            device_ctx.arch_seg_inf[seg_index].usage -= 1;
++        }
++        //}
++
++        VTR_ASSERT(device_ctx.arch_seg_inf[seg_index].usage >= 0);
++        
++        /*float old_base_cost = device_ctx.rr_indexed_data[cost_index].base_cost;
++
++        float base_cost = device_ctx.rr_indexed_data[cost_index].saved_base_cost;
++        int prev_usage = device_ctx.arch_seg_inf[seg_index].prev_usage;
++        int cur_usage = device_ctx.arch_seg_inf[seg_index].usage;
++        int hist_usage = device_ctx.arch_seg_inf[seg_index].historical_usage;
++        if (device_ctx.rr_indexed_data[cost_index].saved_base_cost > device_ctx.reset_cost)
++        {
++            device_ctx.rr_indexed_data[cost_index].base_cost = ((pres_fac <= 1e-3) && (hist_usage == 0)
++                                                               && (!device_ctx.freeze_avalanche)) ? device_ctx.reset_cost :
++            std::max(0.0f, base_cost - cur_usage * device_ctx.avalanche_p
++                                     - hist_usage * device_ctx.avalanche_h
++                                     - (cur_usage - prev_usage) * device_ctx.avalanche_d);
++        }*/
++
++        //Simplifying the above expression to speed up the updates.
++        
++        float base_cost = device_ctx.rr_indexed_data[cost_index].saved_base_cost;
++
++        int hist_usage = device_ctx.arch_seg_inf[seg_index].historical_usage;
++        if (device_ctx.is_reset_iter)
++        {
++            device_ctx.rr_indexed_data[cost_index].base_cost = device_ctx.reset_cost; 
++            return;
++        }
++
++        int cur_usage = device_ctx.arch_seg_inf[seg_index].usage;
++        device_ctx.rr_indexed_data[cost_index].base_cost = std::max(0.0f, base_cost - cur_usage * device_ctx.avalanche_p
++                                                                                    - hist_usage * device_ctx.avalanche_h);
++
++        //VTR_ASSERT(prev_usage >= 0);
++        VTR_ASSERT(cur_usage >= 0);
++        VTR_ASSERT(hist_usage >= 0);
++        VTR_ASSERT(device_ctx.rr_indexed_data[cost_index].base_cost <= 1.1 * base_cost);
++
++        return;
++    }
++
+     // can't have negative occupancy
+     VTR_ASSERT(occ >= 0);
+ 
+@@ -440,6 +539,39 @@
+     }
+ }
+ 
++//SN: This is a debug routine that prints all edge-splitter costs.
++void print_edge_splitter_costs()
++{
++    auto& device_ctx = g_vpr_ctx.device();
++    VTR_LOG("\n\nEdge-splitter costs:\n");
++    for (unsigned i = 0; i < device_ctx.num_arch_segs; ++i)
++    {
++        if (device_ctx.arch_seg_inf[i].length == 0)
++        {
++            float base_cost = device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + i].saved_base_cost;
++            base_cost = std::min(base_cost, device_ctx.rr_indexed_data[CHANX_COST_INDEX_START
++                                + device_ctx.num_arch_segs + i].saved_base_cost);
++            int prev_usage = device_ctx.arch_seg_inf[i].prev_usage;
++            int cur_usage = device_ctx.arch_seg_inf[i].usage;
++            int hist_usage = device_ctx.arch_seg_inf[i].historical_usage;
++            float calc_cost =
++            std::max(0.0f, base_cost - cur_usage * device_ctx.avalanche_p
++                                     - hist_usage * device_ctx.avalanche_h
++                                     - (cur_usage - prev_usage) * device_ctx.avalanche_d);
++
++            float used_base_cost = min(device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + i].base_cost,
++                                       device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + device_ctx.num_arch_segs + i].base_cost);
++
++            VTR_LOG("%d(%s): (%d, %d, %d) -> %g(%g)/%g\n", i, device_ctx.arch_seg_inf[i].name.c_str(),
++                    device_ctx.arch_seg_inf[i].usage, device_ctx.arch_seg_inf[i].historical_usage, prev_usage,
++                    used_base_cost, calc_cost,
++                    device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + i].saved_base_cost);
++            //char tmp;
++            //scanf("%c", &tmp);
++        }
++    }
++}
++
+ void pathfinder_update_cost(float pres_fac, float acc_fac) {
+     /* This routine recomputes the pres_cost and acc_cost of each routing        *
+      * resource for the pathfinder algorithm after all nets have been routed.    *
+@@ -450,10 +582,77 @@
+      * DATE.                                                                     */
+ 
+     int occ, capacity;
+-    auto& device_ctx = g_vpr_ctx.device();
++    auto& device_ctx = g_vpr_ctx.mutable_device();
+     auto& route_ctx = g_vpr_ctx.mutable_routing();
+ 
++    if ((device_ctx.avalanche_p < -1e-15) && !device_ctx.is_reset_iter)
++    {
++        int max_usage = -1;
++        float min_base_cost = 1e12;
++        device_ctx.max_cong_cost = 0.0f;
++        for (int iseg = 0; iseg < device_ctx.num_arch_segs; ++iseg)
++        {
++            int usage = device_ctx.arch_seg_inf[iseg].usage;
++            if (usage > max_usage)
++            {
++                max_usage = usage;
++                min_base_cost = device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + iseg].saved_base_cost;
++            }
++        }
++
++        if (max_usage == 0)
++        {
++            max_usage = 1000;
++            min_base_cost = 1e-12;
++        }
++        device_ctx.min_base_cost = min_base_cost;
++        VTR_LOG("min_base_cost = %g\n", min_base_cost);
++        VTR_LOG("max_usage = %d\n", max_usage);
++        device_ctx.avalanche_p = (float)(min_base_cost) / (max_usage * (1.0 + device_ctx.avalanche_iter_to_zero));
++	    if (device_ctx.avalanche_h < -1e-15)
++	        device_ctx.avalanche_h = device_ctx.avalanche_p / 1.0;
++    	if (device_ctx.avalanche_h < -1e-15)
++            device_ctx.avalanche_d = device_ctx.avalanche_p / 10.0;
++    }
++ 
++    device_ctx.crit_scale = (device_ctx.max_cong_cost > 0) ?
++                            (device_ctx.max_cong_cost / device_ctx.min_base_cost) :
++                            0.0f;
++
++    VTR_LOG("avalanche_p = %g\n", device_ctx.avalanche_p);
++    VTR_LOG("avalanche_h = %g\n", device_ctx.avalanche_h);
++    VTR_LOG("avalanche_d = %g\n", device_ctx.avalanche_d);
++    VTR_LOG("max_cong_cost = %g\n", device_ctx.max_cong_cost);
++    VTR_LOG("crit_scale = %g\n", device_ctx.crit_scale);
++
++    device_ctx.max_cong_cost = 0.0f;
++
+     for (size_t inode = 0; inode < device_ctx.rr_nodes.size(); inode++) {
++
++        auto& node = device_ctx.rr_nodes[inode];
++        if (node.is_edge_splitter())
++        {
++            int cost_index = node.cost_index();
++
++            int seg_index = device_ctx.rr_indexed_data[cost_index].seg_index;
++            float base_cost = device_ctx.rr_indexed_data[cost_index].saved_base_cost;
++            int cur_usage = device_ctx.arch_seg_inf[seg_index].usage;
++            int hist_usage = device_ctx.arch_seg_inf[seg_index].historical_usage;
++
++            device_ctx.rr_indexed_data[cost_index].base_cost = (device_ctx.is_reset_iter) ? device_ctx.reset_cost :
++                std::max(0.0f, base_cost - cur_usage * device_ctx.avalanche_p
++                                         - hist_usage * device_ctx.avalanche_h);
++           
++            int twin_index = cost_index; 
++            if (cost_index < CHANX_COST_INDEX_START + device_ctx.num_arch_segs)
++                twin_index = cost_index + device_ctx.num_arch_segs;
++            else
++                twin_index = cost_index - device_ctx.num_arch_segs;
++
++            device_ctx.rr_indexed_data[twin_index].base_cost = device_ctx.rr_indexed_data[cost_index].base_cost;
++
++            continue;
++        }
+         occ = route_ctx.rr_node_route_inf[inode].occ();
+         capacity = device_ctx.rr_nodes[inode].capacity();
+ 
+@@ -462,13 +661,24 @@
+             route_ctx.rr_node_route_inf[inode].pres_cost = 1.0 + (occ + 1 - capacity) * pres_fac;
+         }
+ 
+-        /* If occ == capacity, we don't need to increase acc_cost, but a change    *
+-         * in pres_fac could have made it necessary to recompute the cost anyway.  */
++        //SN NOTE: It does not matter if the pres_cost is > 1 for edge-splitters, since
++        //their total cost is always returned as the base cost.
+ 
+         else if (occ == capacity) {
+             route_ctx.rr_node_route_inf[inode].pres_cost = 1.0 + pres_fac;
+         }
+     }
++
++    print_edge_splitter_costs();
++    if (!device_ctx.freeze_avalanche)
++    {
++        for (int iseg = 0; iseg < device_ctx.num_arch_segs; ++iseg)
++        {
++            int usage = device_ctx.arch_seg_inf[iseg].usage;
++            device_ctx.arch_seg_inf[iseg].prev_usage = device_ctx.arch_seg_inf[iseg].usage;
++            device_ctx.arch_seg_inf[iseg].historical_usage += device_ctx.arch_seg_inf[iseg].usage;
++        }
++    }
+ }
+ 
+ void init_heap(const DeviceGrid& grid) {
+@@ -743,13 +953,31 @@
+ /* Returns the congestion cost of using this rr_node, *ignoring* 
+  * non-configurable edges */
+ static float get_single_rr_cong_cost(int inode) {
+-    auto& device_ctx = g_vpr_ctx.device();
++    auto& device_ctx = g_vpr_ctx.mutable_device();
+     auto& route_ctx = g_vpr_ctx.routing();
+ 
+     auto cost_index = device_ctx.rr_nodes[inode].cost_index();
++    if (device_ctx.rr_nodes[inode].is_edge_splitter())
++        return device_ctx.rr_indexed_data[cost_index].base_cost;
++
+     float cost = device_ctx.rr_indexed_data[cost_index].base_cost
+                  * route_ctx.rr_node_route_inf[inode].acc_cost
+                  * route_ctx.rr_node_route_inf[inode].pres_cost;
++
++    cost += std::abs(device_ctx.wire_lookahead_weight);
++            //SN: To be able to scale up the lookahead, we must include this.
++            //Otherwise, as soon as the router encounters a path with cheaper switches,
++            //it will simply not pop other nodes pushed with the same hop-count prediction.
++            //This will inevitable lead to very noisy statistics.
++            //If we were to simply increase the base cost of wires, or reduce the base cost
++            //of the switches, congestion would too quickly take over the decisions.
++
++    /*if (cost > device_ctx.max_cong_cost)
++    {
++        device_ctx.max_cong_cost = cost;
++        //device_ctx.crit_scale = cost / device_ctx.min_base_cost;
++    }*/
++
+     return cost;
+ }
+ 
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_common.h vtr8_avalanche/vpr/src/route/route_common.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_common.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/route_common.h	2022-11-30 23:03:50.593585000 +0100
+@@ -32,6 +32,9 @@
+  *          linked list.  Not used when on the heap.
+  *
+  */
++
++void print_edge_splitter_costs();
++
+ struct t_heap {
+     float cost = 0.;
+     float backward_path_cost = 0.;
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_export.h vtr8_avalanche/vpr/src/route/route_export.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_export.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/route_export.h	2022-11-30 23:03:50.600573000 +0100
+@@ -9,7 +9,7 @@
+ void try_graph(int width_fac, t_router_opts router_opts, t_det_routing_arch* det_routing_arch, std::vector<t_segment_inf>& segment_inf, t_chan_width_dist chan_width_dist, t_direct_inf* directs, int num_directs);
+ 
+ bool try_route(int width_fac,
+-               const t_router_opts& router_opts,
++               t_router_opts& router_opts,
+                const t_analysis_opts& analysis_opts,
+                t_det_routing_arch* det_routing_arch,
+                std::vector<t_segment_inf>& segment_inf,
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/router_delay_profiling.cpp vtr8_avalanche/vpr/src/route/router_delay_profiling.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/router_delay_profiling.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/router_delay_profiling.cpp	2022-11-30 23:03:50.704543000 +0100
+@@ -41,6 +41,7 @@
+     std::vector<int> modified_rr_node_inf;
+     RouterStats router_stats;
+     auto router_lookahead = make_router_lookahead(router_opts.lookahead_type);
++    //printf("Delay profiling lookahead computed.\n");
+     t_heap* cheapest = timing_driven_route_connection_from_route_tree(rt_root, sink_node, cost_params, bounding_box, *router_lookahead, modified_rr_node_inf, router_stats);
+ 
+     bool found_path = (cheapest != nullptr);
+@@ -48,6 +49,7 @@
+         VTR_ASSERT(cheapest->index == sink_node);
+ 
+         t_rt_node* rt_node_of_sink = update_route_tree(cheapest, nullptr);
++        //SN_DEBUG: print_route_tree(rt_root);
+         free_heap_data(cheapest);
+ 
+         //find delay
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/router_lookahead.cpp vtr8_avalanche/vpr/src/route/router_lookahead.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/router_lookahead.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/router_lookahead.cpp	2022-11-30 23:03:50.723564000 +0100
+@@ -72,8 +72,10 @@
+ 
+     t_rr_type rr_type = device_ctx.rr_nodes[current_node].type();
+ 
++    //int edge_splitter = device_ctx.rr_nodes[current_node].is_edge_splitter();
++
+     if (rr_type == CHANX || rr_type == CHANY) {
+-        return get_lookahead_map_cost(current_node, target_node, params.criticality);
++        return get_lookahead_map_cost(current_node, target_node, params.criticality);//edge_splitter ? params.criticality : params.exp_criticality);
+     } else if (rr_type == IPIN) { /* Change if you're allowing route-throughs */
+         return (device_ctx.rr_indexed_data[SINK_COST_INDEX].base_cost);
+     } else { /* Change this if you want to investigate route-throughs */
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/router_lookahead_map.cpp vtr8_avalanche/vpr/src/route/router_lookahead_map.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/router_lookahead_map.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/router_lookahead_map.cpp	2022-11-30 23:03:50.743594000 +0100
+@@ -162,7 +162,12 @@
+             VTR_ASSERT(device_ctx.rr_indexed_data[cost_index].T_quadratic <= 0.);
+             VTR_ASSERT(device_ctx.rr_indexed_data[cost_index].C_load <= 0.);
+             this->delay += device_ctx.rr_indexed_data[cost_index].T_linear;
+-
++            //if (device_ctx.rr_indexed_data[cost_index].base_cost > 1e-8)
++            //{
++            //    printf("Cost not reset for %d (%g)\n", cost_index, device_ctx.rr_indexed_data[cost_index].base_cost);
++            //    char tmp;
++            //    scanf("%c", &tmp);
++            //}
+             this->congestion_upstream += device_ctx.rr_indexed_data[cost_index].base_cost;
+         }
+ 
+@@ -238,25 +243,82 @@
+     float expected_delay = cost_entry.delay;
+     float expected_congestion = cost_entry.congestion;
+ 
++    //SN: FIXME: Just experimenting with lower bounds on hops.
++    if (device_ctx.wire_lookahead_weight < -1e-15)
++        expected_congestion = (std::ceil((float)delta_x / 6.0f) + std::ceil((float)delta_y / 4.0f))
++                            * (-1 * device_ctx.wire_lookahead_weight);
++
++    /*if (device_ctx.boost_lookahead && from_node.is_edge_splitter())
++    {
++        float expected_cost = criticality_fac * expected_delay + (device_ctx.M - criticality_fac) * expected_congestion
++                            * device_ctx.lookahead_boost_factor;
++        
++        return expected_cost;
++    }*/
++        
+     float expected_cost = criticality_fac * expected_delay + (1.0 - criticality_fac) * expected_congestion;
+     return expected_cost;
+ }
+ 
+ /* Computes the lookahead map to be used by the router. If a map was computed prior to this, a new one will not be computed again.
+  * The rr graph must have been built before calling this function. */
+-void compute_router_lookahead(int num_segments) {
++void compute_router_lookahead(int num_segments, std::vector<t_segment_inf>& segment_inf) {
+     vtr::ScopedStartFinishTimer timer("Computing router lookahead map");
+ 
+     f_cost_map.clear();
+ 
+-    auto& device_ctx = g_vpr_ctx.device();
+-
++    auto& device_ctx = g_vpr_ctx.mutable_device();
++    device_ctx.freeze_avalanche = 0;
++    device_ctx.ripup_all = 0;
++        
+     /* free previous delay map and allocate new one */
+     free_cost_map();
++    //printf("seg_no = %d\n", num_segments);
+     alloc_cost_map(num_segments);
+ 
++    //SN: First reset the base costs of the edge-splitters to zero, to keep lookahead admissibility as the costs drop.
++                
++    float wire_bump_cost = std::max(0.0f, device_ctx.wire_lookahead_weight);
++    //SN: Bumping the wire cost in the lookahead as well as (additively) in the congestion cost will prevent
++    //overconcentration on some wire types, because of the switches, it will make the lookahead effective again,
++    //and will keep it admissible (due to the additive bump in the congestion cost query).
++    
++    for (int iseg = 0; iseg < num_segments; iseg++)
++    {
++        int length = segment_inf[iseg].length;
++        if (length != 0)
++        {
++            //SN: We want to reset the edge-splitter costs and add the maximum edge-splitter cost to every wire.
++            //This way, the lookahead will be uniform and depend solely on the wires themselves, driving the router
++            //to more natural choices. By attributing the cost to the wires, we also don't care which potential nodes
++            //are removed from the graph in the subsequent iterations of the search.
++            //
++            //Overall, the runtime should be reduced significantly, as the lookahead should once again become effective.
++            device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + iseg].base_cost += wire_bump_cost;
++            device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + num_segments + iseg].base_cost += wire_bump_cost;
++            continue;
++        }
++   
++        device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + iseg].base_cost = 0;
++        device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + num_segments + iseg].base_cost = 0;
++ 
++        //SN: Also set the segment usage fields to zero.
++        segment_inf[iseg].prev_usage = 0;
++        segment_inf[iseg].usage = 0;
++        segment_inf[iseg].historical_usage = 0;
++        device_ctx.arch_seg_inf[iseg].prev_usage = 0;
++        device_ctx.arch_seg_inf[iseg].historical_usage = 0;
++        device_ctx.arch_seg_inf[iseg].usage = 0;
++    }
++
+     /* run Dijkstra's algorithm for each segment type & channel type combination */
+     for (int iseg = 0; iseg < num_segments; iseg++) {
++        int length = segment_inf[iseg].length;
++        //printf("seg_id = %d, length = %d\n", iseg, length);
++        if (length == 0)
++        {
++            continue;
++        }
+         for (e_rr_type chan_type : {CHANX, CHANY}) {
+             /* allocate the cost map for this iseg/chan_type */
+             t_routing_cost_map routing_cost_map({device_ctx.grid.width(), device_ctx.grid.height()});
+@@ -267,6 +329,7 @@
+                     int start_node_ind = get_start_node_ind(REF_X + ref_inc, REF_Y + ref_inc,
+                                                             device_ctx.grid.width() - 2, device_ctx.grid.height() - 2, //non-corner upper right
+                                                             chan_type, iseg, track_offset);
++                    //printf("start_node = %d\n", start_node_ind);
+ 
+                     if (start_node_ind == UNDEFINED) {
+                         continue;
+@@ -280,6 +343,7 @@
+             /* boil down the cost list in routing_cost_map at each coordinate to a representative cost entry and store it in the lookahead
+              * cost map */
+             set_lookahead_map_costs(iseg, chan_type, routing_cost_map);
++            //print_cost_map();
+ 
+             /* fill in missing entries in the lookahead cost map by copying the closest cost entries (cost map was computed based on
+              * a reference coordinate > (0,0) so some entries that represent a cross-chip distance have not been computed) */
+@@ -287,6 +351,72 @@
+         }
+     }
+ 
++    //SN: Now copy the computed map to the edge-splitting nodes:
++    for (int iseg = 0; iseg < num_segments; iseg++)
++    {
++        //SN: Now restore the base cost.
++        device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + iseg].base_cost
++        = device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + iseg].saved_base_cost;   
++
++        device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + num_segments + iseg].base_cost
++        = device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + num_segments + iseg].saved_base_cost;   
++
++        int length = segment_inf[iseg].length;
++        if (length != 0)
++            continue;
++
++        //printf("iseg = %d\n", iseg);
++        //char tmp;
++        //scanf("%c", &tmp);
++
++        int center_x = device_ctx.grid.width() / 2;
++        int center_y = device_ctx.grid.height() / 2;
++        e_rr_type chan_type = CHANX; 
++        int start_node_ind = get_start_node_ind(center_y, center_x,
++                                                device_ctx.grid.width() - 2, device_ctx.grid.height() - 2,
++                                                chan_type, iseg, -1);
++        //NOTE: CHANX coordinates are inverted in device_ctx.rr_node_indices, for some reason (see l.801 in rr_graph_reader.cpp)
++        if (start_node_ind == UNDEFINED)
++        {
++            //printf("c = (%d, %d), iseg = %d\n", center_x, center_y, iseg);
++            chan_type = CHANY;
++            start_node_ind = get_start_node_ind(center_x, center_y,
++                                                device_ctx.grid.width() - 2, device_ctx.grid.height() - 2,
++                                                chan_type, iseg, -1);
++            VTR_ASSERT(start_node_ind != UNDEFINED);
++        }
++
++        auto& start_node = device_ctx.rr_nodes[start_node_ind];
++        VTR_ASSERT(start_node.num_edges() > 0);
++
++        int child_ind = start_node.edge_sink_node(0);
++        auto& child_node = device_ctx.rr_nodes[child_ind];
++        
++        int child_cost_index = child_node.cost_index();
++        int child_seg_index = device_ctx.rr_indexed_data[child_cost_index].seg_index;
++
++        VTR_ASSERT(child_seg_index >= 0);
++
++        for (unsigned chan_index = 0; chan_index < 2; ++chan_index)
++        {
++            for (unsigned ix = 0; ix < device_ctx.grid.width(); ix++)
++            {
++                for (unsigned iy = 0; iy < device_ctx.grid.height(); iy++)
++                {
++                    //printf("%d, %d, %d, %d\n", chan_index, child_seg_index, ix, iy);
++                    Cost_Entry cost_entry = f_cost_map[chan_index][child_seg_index][ix][iy];
++                    f_cost_map[chan_index][iseg][ix][iy] = cost_entry;
++                    //FIXME: This scaling factor should depend on the scaling factor of the base costs.
++                    //f_cost_map[chan_index][iseg][ix][iy] = Cost_Entry(cost_entry.delay, cost_entry.congestion * 1e7);
++                    /*printf("%g, %g\n", cost_entry.delay, cost_entry.congestion);
++                    char tmp;
++                    scanf("%c", &tmp);*/
++                }
++            }
++        }
++    }
++
++    //printf("Compute call ended.\n");
+     if (false) print_cost_map();
+ }
+ 
+@@ -310,18 +440,28 @@
+ 
+     const vector<int>& channel_node_list = device_ctx.rr_node_indices[rr_type][start_x][start_y][0];
+ 
++    //SN_DEBUG:
++    //printf("%s start = (%d, %d), end = (%d, %d)\n", rr_type == CHANX ? "CHANX" : "CHANY", start_x, start_y, target_x, target_y);
++    //printf("seg_index = %d, track_offset = %d, channel_size = %d\n", seg_index, track_offset, channel_node_list.size());
+     /* find first node in channel that has specified segment index and goes in the desired direction */
+     for (unsigned itrack = 0; itrack < channel_node_list.size(); itrack++) {
+         int node_ind = channel_node_list[itrack];
++        //printf("node_ind = %d, itrack = %d\n", node_ind, itrack);
++        if (node_ind < 0)
++            continue;
++        //SN TODO: Check if this is the right thing to do.
+ 
+         e_direction node_direction = device_ctx.rr_nodes[node_ind].direction();
+         int node_cost_ind = device_ctx.rr_nodes[node_ind].cost_index();
+         int node_seg_ind = device_ctx.rr_indexed_data[node_cost_ind].seg_index;
+ 
+-        if ((node_direction == direction || node_direction == BI_DIRECTION) && node_seg_ind == seg_index) {
++        //SN_DEBUG:       
++        //printf("%d (seg_id = %d; cost_ind = %d)\n", node_ind, node_seg_ind, node_cost_ind);
++
++        if ((track_offset < 0 || node_direction == direction || node_direction == BI_DIRECTION) && node_seg_ind == seg_index) {
+             /* found first track that has the specified segment index and goes in the desired direction */
+             result = node_ind;
+-            if (track_offset == 0) {
++            if (track_offset <= 0) {
+                 break;
+             }
+             track_offset -= 2;
+@@ -367,6 +507,8 @@
+         pq.pop();
+ 
+         int node_ind = current.rr_node_ind;
++        //SN_debug:
++        //printf("u = %d\n", node_ind);
+ 
+         /* check that we haven't already expanded from this node */
+         if (node_expanded[node_ind]) {
+@@ -426,6 +568,7 @@
+ 
+ /* sets the lookahead cost map entries based on representative cost entries from routing_cost_map */
+ static void set_lookahead_map_costs(int segment_index, e_rr_type chan_type, t_routing_cost_map& routing_cost_map) {
++    //printf("Setting the cost\n");
+     int chan_index = 0;
+     if (chan_type == CHANY) {
+         chan_index = 1;
+@@ -439,6 +582,7 @@
+             f_cost_map[chan_index][segment_index][ix][iy] = expansion_cost_entry.get_representative_cost_entry(REPRESENTATIVE_ENTRY_METHOD);
+         }
+     }
++    //printf("Cost set.\n");
+ }
+ 
+ /* fills in missing lookahead map entries by copying the cost of the closest valid entry */
+@@ -454,18 +598,22 @@
+     for (unsigned ix = 0; ix < device_ctx.grid.width(); ix++) {
+         for (unsigned iy = 0; iy < device_ctx.grid.height(); iy++) {
+             Cost_Entry cost_entry = f_cost_map[chan_index][segment_index][ix][iy];
+-
++            //printf("chan_index = %d, segment_index = %d, ix = %d, iy = %d\n", chan_index, segment_index, ix, iy);
+             if (cost_entry.delay < 0 && cost_entry.congestion < 0) {
++                //printf("cost_entry.delay = %f, cost_entry.congestion = %f\n", cost_entry.delay, cost_entry.congestion);
+                 Cost_Entry copied_entry = get_nearby_cost_entry(ix, iy, segment_index, chan_index);
++                //printf("Storing the copy (%.g, %.2g).\n", copied_entry.delay, copied_entry.congestion);
+                 f_cost_map[chan_index][segment_index][ix][iy] = copied_entry;
+             }
+         }
+     }
+ }
+ 
+-/* returns a cost entry in the f_cost_map that is near the specified coordinates (and preferably towards (0,0)) */
++
++//SN: Bug fix taken from the official development branch of VPR,  "Latest commit f51482e on Sep 14"
++/* returns a cost entry in the f_wire_cost_map that is near the specified coordinates (and preferably towards (0,0)) */
+ static Cost_Entry get_nearby_cost_entry(int x, int y, int segment_index, int chan_index) {
+-    /* compute the slope from x,y to 0,0 and then move towards 0,0 by one unit to get the coordinates
++    /* , segment_infcompute the slope from x,y to 0,0 and then move towards 0,0 by one unit to get the coordinates
+      * of the cost entry to be copied */
+ 
+     //VTR_ASSERT(x > 0 || y > 0); //Asertion fails in practise. TODO: debug
+@@ -488,18 +636,65 @@
+         copy_y = vtr::nint((float)x * slope);
+     }
+ 
+-    //VTR_ASSERT(copy_x > 0 || copy_y > 0); //Asertion fails in practise. TODO: debug
++    copy_y = std::max(copy_y, 0); //Clip to zero
++    copy_x = std::max(copy_x, 0); //Clip to zero
+ 
+     Cost_Entry copy_entry = f_cost_map[chan_index][segment_index][copy_x][copy_y];
+ 
+     /* if the entry to be copied is also empty, recurse */
+     if (copy_entry.delay < 0 && copy_entry.congestion < 0) {
+-        copy_entry = get_nearby_cost_entry(copy_x, copy_y, segment_index, chan_index);
++        if (copy_x == 0 && copy_y == 0) {
++            copy_entry = Cost_Entry(0., 0.); //(0, 0) entry is invalid so set zero to terminate recursion
++        } else {
++            copy_entry = get_nearby_cost_entry(copy_x, copy_y, segment_index, chan_index);
++        }
+     }
+ 
+     return copy_entry;
+ }
+ 
++//SN: Below is the original V8.0 code.
++///* returns a cost entry in the f_cost_map that is near the specified coordinates (and preferably towards (0,0)) */
++//static Cost_Entry get_nearby_cost_entry(int x, int y, int segment_index, int chan_index) {
++//    /* compute the slope from x,y to 0,0 and then move towards 0,0 by one unit to get the coordinates
++//     * of the cost entry to be copied */
++//
++//    //VTR_ASSERT(x > 0 || y > 0); //Asertion fails in practise. TODO: debug
++//
++//    float slope;
++//    if (x == 0) {
++//        slope = 1e12; //just a really large number
++//    } else if (y == 0) {
++//        slope = 1e-12; //just a really small number
++//    } else {
++//        slope = (float)y / (float)x;
++//    }
++//
++//    int copy_x, copy_y;
++//    if (slope >= 1.0) {
++//        copy_y = y - 1;
++//        copy_x = vtr::nint((float)y / slope);
++//    } else {
++//        copy_x = x - 1;
++//        copy_y = vtr::nint((float)x * slope);
++//    }
++//
++//    //SN: added this to avoid crashes temporarily.
++//    //if (x == 0 && y == 0)
++//    //    copy_x = copy_y = 1;
++//
++//    //VTR_ASSERT(copy_x > 0 || copy_y > 0); //Asertion fails in practise. TODO: debug
++//    printf("chan_index = %d, segment_index = %d, copy_x = %d, copy_y = %d\n", chan_index, segment_index, copy_x, copy_y);
++//    Cost_Entry copy_entry = f_cost_map[chan_index][segment_index][copy_x][copy_y];
++//
++//    /* if the entry to be copied is also empty, recurse */
++//    if (copy_entry.delay < 0 && copy_entry.congestion < 0) {
++//        copy_entry = get_nearby_cost_entry(copy_x, copy_y, segment_index, chan_index);
++//    }
++//
++//    return copy_entry;
++//}
++
+ /* returns cost entry with the smallest delay */
+ Cost_Entry Expansion_Cost_Entry::get_smallest_entry() {
+     Cost_Entry smallest_entry;
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/router_lookahead_map.h vtr8_avalanche/vpr/src/route/router_lookahead_map.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/router_lookahead_map.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/router_lookahead_map.h	2022-11-30 23:03:50.751557000 +0100
+@@ -2,7 +2,7 @@
+ 
+ /* Computes the lookahead map to be used by the router. If a map was computed prior to this, a new one will not be computed again.
+  * The rr graph must have been built before calling this function. */
+-void compute_router_lookahead(int num_segments);
++void compute_router_lookahead(int num_segments, std::vector<t_segment_inf>& segment_inf);
+ 
+ /* queries the lookahead_map (should have been computed prior to routing) to get the expected cost
+  * from the specified source to the specified target */
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_timing.cpp vtr8_avalanche/vpr/src/route/route_timing.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_timing.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/route_timing.cpp	2022-11-30 23:03:50.624563000 +0100
+@@ -39,6 +39,11 @@
+ 
+ #define CONGESTED_SLOPE_VAL -0.04
+ //#define ROUTER_DEBUG
++//
++
++//SN: Define the maximum fanout increase to be used in random shuffling.
++#define MAX_FANOUT_INC 6
++bool RANDOM_SORT_NETS = false;
+ 
+ enum class RouterCongestionMode {
+     NORMAL,
+@@ -256,7 +261,17 @@
+ struct more_sinks_than {
+     inline bool operator()(const ClusterNetId net_index1, const ClusterNetId net_index2) {
+         auto& cluster_ctx = g_vpr_ctx.clustering();
+-        return cluster_ctx.clb_nlist.net_sinks(net_index1).size() > cluster_ctx.clb_nlist.net_sinks(net_index2).size();
++        //int fanout_inc = 0;
++        //if (RANDOM_SORT_NETS)
++        //{
++        //    fanout_inc = std::rand() % MAX_FANOUT_INC;
++    	//    VTR_LOG("inc = %d\n", fanout_inc);
++	    //}
++	    int fanout1 = cluster_ctx.clb_nlist.net_sinks(net_index1).size();
++        int fanout2 = cluster_ctx.clb_nlist.net_sinks(net_index2).size();
++        if (fanout1 != fanout2)
++            return  fanout1 > fanout2;
++        return net_index1 < net_index2;
+     }
+ };
+ 
+@@ -303,7 +318,7 @@
+ static bool same_non_config_node_set(int from_node, int to_node);
+ 
+ /************************ Subroutine definitions *****************************/
+-bool try_timing_driven_route(const t_router_opts& router_opts,
++bool try_timing_driven_route(t_router_opts& router_opts,
+                              const t_analysis_opts& analysis_opts,
+                              vtr::vector<ClusterNetId, float*>& net_delay,
+                              const ClusteredPinAtomPinsLookup& netlist_pin_lookup,
+@@ -316,6 +331,7 @@
+ 
+     auto& cluster_ctx = g_vpr_ctx.clustering();
+     auto& route_ctx = g_vpr_ctx.mutable_routing();
++    auto& device_ctx = g_vpr_ctx.mutable_device();
+ 
+     //Initially, the router runs normally trying to reduce congestion while
+     //balancing other metrics (timing, wirelength, run-time etc.)
+@@ -326,7 +342,56 @@
+ 
+     //sort so net with most sinks is routed first.
+     auto sorted_nets = std::vector<ClusterNetId>(cluster_ctx.clb_nlist.nets().begin(), cluster_ctx.clb_nlist.nets().end());
++
++    //VTR_LOG("Net number before sorting = %d\n", sorted_nets.size());
++
++    //SN: Sort the neets randomly, if specified.
++    if(router_opts.random_sort_nets)
++    {
++	VTR_LOG("setting random seed %d\n", router_opts.random_sort_nets_seed);
++        std::srand(router_opts.random_sort_nets_seed);
++        RANDOM_SORT_NETS = true;
++        //std::random_shuffle(sorted_nets.begin(), sorted_nets.end());
++    }
++    //else
++    //{
+     std::sort(sorted_nets.begin(), sorted_nets.end(), more_sinks_than());
++    //for (auto inet : sorted_nets)
++    //    VTR_LOG("init_sort_net %d\n", inet);
++    //}
++    //VTR_LOG("Net number after sorting = %d\n", sorted_nets.size());
++    if(RANDOM_SORT_NETS)
++    {
++        #define SWAP_CNT 100
++        #define MAX_DISTANCE 6
++        std::vector<ClusterNetId> moved_nets;
++        for(unsigned i = 0; i < SWAP_CNT; ++i)
++        {
++            int swap_i = 0;
++            int swap_j = 0;
++            bool legal = false;
++            while(!legal)
++            {
++                swap_i = std::rand() % sorted_nets.size();
++                if(std::find(moved_nets.begin(), moved_nets.end(), sorted_nets[swap_i]) == moved_nets.end())
++                    legal = true;
++            }
++            legal = false;
++            while(!legal)
++            {
++                swap_j = std::rand() % sorted_nets.size();
++                if(std::find(moved_nets.begin(), moved_nets.end(), sorted_nets[swap_j]) != moved_nets.end())
++                    continue;
++                if((swap_j != swap_i) && (std::abs(swap_j - swap_i) <= MAX_DISTANCE))
++                    legal = true;
++            }
++            moved_nets.push_back(sorted_nets[swap_i]);
++            moved_nets.push_back(sorted_nets[swap_j]);
++            auto swap_tmp = sorted_nets[swap_i];
++            sorted_nets[swap_i] = sorted_nets[swap_j];
++            sorted_nets[swap_j] = swap_tmp;
++        }
++    }
+ 
+     /*
+      * Configure the routing predictor
+@@ -360,11 +425,14 @@
+     route_budgets budgeting_inf;
+ 
+     auto router_lookahead = make_router_lookahead(router_opts.lookahead_type);
++    printf("Lookahead computed.\n");
+ 
+     /*
+      * Routing parameters
+      */
+     float pres_fac = router_opts.first_iter_pres_fac; /* Typically 0 -> ignore cong. */
++    device_ctx.boost_lookahead = 0;
++    device_ctx.is_reset_iter = 1;
+     int bb_fac = router_opts.bb_factor;
+ 
+     //When routing conflicts are detected the bounding boxes are scaled
+@@ -405,6 +473,44 @@
+     int num_net_bounding_boxes_updated = 0;
+     int itry_since_last_convergence = -1;
+     for (itry = 1; itry <= router_opts.max_router_iterations; ++itry) {
++
++        const double RIPUP_INTERVAL = 5.0;
++        if ((itry % (int)(std::min(1.0 + 0.1 * (legal_convergence_count ? itry_since_last_convergence : itry), RIPUP_INTERVAL))) == 0)
++        {
++            device_ctx.ripup_all = 1;
++        }
++        else
++        {
++            device_ctx.ripup_all = 0;
++        }
++        if (device_ctx.has_potential_switches == 0)
++        {
++            device_ctx.ripup_all = 0;
++        }
++
++        if (0 && (itry == 2))
++        {
++           //Now recompute the lookahead to make it more effective.
++            //SN: Does not work very well in practise.
++           for (unsigned i = 0; i < device_ctx.num_arch_segs; ++i)
++           {
++                if (device_ctx.arch_seg_inf[i].length == 0)
++                {
++                    float base_cost = device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + i].saved_base_cost;
++                    base_cost = std::min(base_cost, device_ctx.rr_indexed_data[CHANX_COST_INDEX_START
++                                        + device_ctx.num_arch_segs + i].saved_base_cost);
++                    float final_cost = std::max(0.0f, base_cost - device_ctx.arch_seg_inf[i].usage * device_ctx.avalanche_h
++                                                                  * router_opts.max_router_iterations);
++   
++                    device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + i].base_cost = final_cost;
++                    device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + device_ctx.num_arch_segs + i].base_cost = final_cost;
++                }
++            }
++            compute_router_lookahead(device_ctx.num_arch_segs, (std::vector<t_segment_inf>&)device_ctx.arch_seg_inf);
++            pathfinder_update_cost(pres_fac, 0.0f);
++        } 
++
++
+         RouterStats router_iteration_stats;
+ 
+         /* Reset "is_routed" and "is_fixed" flags to indicate nets not pre-routed (yet) */
+@@ -434,7 +540,13 @@
+         /*
+          * Route each net
+          */
++        
++        if (itry == 1)
++        {
++            pathfinder_update_cost(pres_fac, 0.); /* Acc_fac=0 for first iter. */
++        }
+         for (auto net_id : sorted_nets) {
++            //VTR_LOG("net %d\n", net_id);
+             bool is_routable = try_timing_driven_route_net(net_id,
+                                                            itry,
+                                                            pres_fac,
+@@ -464,8 +576,11 @@
+         float est_success_iteration = routing_predictor.estimate_success_iteration();
+ 
+         overuse_info = calculate_overuse_info();
++        VTR_LOG("Overuse info generated.\n");
+         wirelength_info = calculate_wirelength_info();
++        VTR_LOG("WL info generated.\n");
+         routing_predictor.add_iteration_overuse(itry, overuse_info.overused_nodes());
++        VTR_LOG("Predictor done.\n");
+ 
+         if (timing_info) {
+             //Update timing based on the new routing
+@@ -481,6 +596,7 @@
+                 generate_route_timing_reports(router_opts, analysis_opts, *timing_info, *delay_calc);
+             }
+         }
++        VTR_LOG("Timing info ok.\n");
+ 
+         float iter_cumm_time = iteration_timer.elapsed_sec();
+         float iter_elapsed_time = iter_cumm_time - prev_iter_cumm_time;
+@@ -532,12 +648,40 @@
+                     best_routing_metrics.critical_path = critical_path;
+                 }
+                 best_routing_metrics.used_wirelength = wirelength_info.used_wirelength();
+-            }
++                router_opts.reconvergence_cpd_threshold = 2.0;
++                //device_ctx.freeze_avalanche = 1;
+ 
++                if (0 && (router_opts.max_convergence_count > 1))
++                {
++                    for (unsigned i = 0; i < device_ctx.num_arch_segs; ++i)
++                    {
++                        if (device_ctx.arch_seg_inf[i].length == 0)
++                        {
++                            float base_cost = device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + i].saved_base_cost;
++                            base_cost = std::min(base_cost, device_ctx.rr_indexed_data[CHANX_COST_INDEX_START
++                                                + device_ctx.num_arch_segs + i].saved_base_cost);
++                            int prev_usage = device_ctx.arch_seg_inf[i].prev_usage;
++                            int cur_usage = device_ctx.arch_seg_inf[i].usage;
++                            int hist_usage = device_ctx.arch_seg_inf[i].historical_usage;
++                            float calc_cost =
++                            std::max(0.0f, base_cost - cur_usage * device_ctx.avalanche_p
++                                                     - hist_usage * device_ctx.avalanche_h
++                                                     - (cur_usage - prev_usage) * device_ctx.avalanche_d);
++    
++                            device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + i].saved_base_cost = calc_cost;
++                            device_ctx.rr_indexed_data[CHANX_COST_INDEX_START + device_ctx.num_arch_segs + i]
++                                      .saved_base_cost = calc_cost;
++                        }
++                    }
++                    device_ctx.avalanche_p = 0.0;
++                    device_ctx.avalanche_h = 0.0;
++                    device_ctx.avalanche_d = 0.0;
++                }
++            }
+             //Decrease pres_fac so that criticl connections will take more direct routes
+             //Note that we use first_iter_pres_fac here (typically zero), and switch to
+             //use initial_pres_fac on the next iteration.
+-            pres_fac = router_opts.first_iter_pres_fac;
++            //pres_fac = router_opts.first_iter_pres_fac;
+ 
+             //Reduce timing tolerances to re-route more delay-suboptimal signals
+             connections_inf.set_connection_criticality_tolerance(0.7);
+@@ -549,11 +693,24 @@
+             VTR_ASSERT(routing_is_successful);
+         }
+ 
++        /*if (itry_since_last_convergence == 0)
++        {
++            device_ctx.ripup_all = 1;
++        }
++        else
++        {
++            device_ctx.ripup_all = 0;
++        }*/
++
+         if (itry_since_last_convergence == 1) {
+             //We used first_iter_pres_fac when we started routing again
+             //after the first routing convergence. Since that is often zero,
+             //we want to set pres_fac to a reasonable (i.e. typically non-zero)
+             //value afterwards -- so it grows when multiplied by pres_fac_mult
++
++            //SN: We do not wish to loose the congestion information when trying to reconcentrate the low-utilized nodes.
++            //Perhaps just reduce the congestion contribution to the point when it matches the 
++            //if (!device_ctx.freeze_avalanche)
+             pres_fac = router_opts.initial_pres_fac;
+         }
+ 
+@@ -601,12 +758,21 @@
+         //Update pres_fac and resource costs
+         if (itry == 1) {
+             pres_fac = router_opts.initial_pres_fac;
++            device_ctx.boost_lookahead = 0;//1;
++            device_ctx.is_reset_iter = 0;
++            VTR_LOG("Boosting Lookahead.\n");
++            //printf("Updating costs, pres_fac = %f\n", pres_fac);
++            //char tmp;
++            //scanf("%c", &tmp);
+             pathfinder_update_cost(pres_fac, 0.); /* Acc_fac=0 for first iter. */
+-        } else {
+-            pres_fac *= router_opts.pres_fac_mult;
++        } else
++        {
++            if (!device_ctx.freeze_avalanche) {
++                pres_fac *= router_opts.pres_fac_mult;
+ 
+-            /* Avoid overflow for high iteration counts, even if acc_cost is big */
+-            pres_fac = min(pres_fac, static_cast<float>(HUGE_POSITIVE_FLOAT / 1e5));
++                /* Avoid overflow for high iteration counts, even if acc_cost is big */
++                pres_fac = min(pres_fac, static_cast<float>(HUGE_POSITIVE_FLOAT / 1e5));
++            }
+ 
+             pathfinder_update_cost(pres_fac, router_opts.acc_fac);
+         }
+@@ -674,7 +840,6 @@
+ 
+                 //Yes, if explicitly enabled
+                 bool should_ripup_for_delay = (router_opts.incr_reroute_delay_ripup == e_incr_reroute_delay_ripup::ON);
+-
+                 //Or, if things are not too congested
+                 should_ripup_for_delay |= (router_opts.incr_reroute_delay_ripup == e_incr_reroute_delay_ripup::AUTO
+                                            && router_congestion_mode == RouterCongestionMode::NORMAL);
+@@ -717,17 +882,21 @@
+         VTR_LOG("Restoring best routing\n");
+ 
+         auto& router_ctx = g_vpr_ctx.mutable_routing();
++        print_edge_splitter_costs();
+ 
+         /* Restore congestion from best route */
+         for (auto net_id : cluster_ctx.clb_nlist.nets()) {
+             pathfinder_update_path_cost(route_ctx.trace[net_id].head, -1, pres_fac);
+             pathfinder_update_path_cost(best_routing[net_id].head, 1, pres_fac);
+         }
++
+         router_ctx.trace = best_routing;
+         router_ctx.clb_opins_used_locally = best_clb_opins_used_locally;
+ 
++        //print_edge_splitter_costs();
+         prune_unused_non_configurable_nets(connections_inf);
+ 
++        //print_edge_splitter_costs();
+         if (timing_info) {
+             VTR_LOG("Critical path: %g ns\n", 1e9 * best_routing_metrics.critical_path.delay());
+         }
+@@ -736,7 +905,7 @@
+     } else {
+         VTR_LOG("Routing failed.\n");
+ #ifdef VTR_ENABLE_DEBUG_LOGGING
+-        if (f_router_debug) print_invalid_routing_info();
++        if (1 || f_router_debug) print_invalid_routing_info();
+ #endif
+     }
+ 
+@@ -762,6 +931,11 @@
+     auto& cluster_ctx = g_vpr_ctx.clustering();
+     auto& route_ctx = g_vpr_ctx.mutable_routing();
+ 
++    auto& device_ctx = g_vpr_ctx.mutable_device();
++    device_ctx.max_criticality = router_opts.max_criticality;
++    device_ctx.M = log(device_ctx.target_critical_splitter_cost / device_ctx.base_cost_scale)
++                 / pow(device_ctx.max_criticality, device_ctx.edge_splitter_crit_exp);
++   
+     bool is_routed = false;
+ 
+     connections_inf.prepare_routing_for_net(net_id);
+@@ -986,6 +1160,12 @@
+         enable_router_debug(router_opts, net_id, sink_rr);
+ 
+         cost_params.criticality = pin_criticality[target_pin];
++        //cost_params.exp_criticality = pow(cost_params.criticality, device_ctx.edge_splitter_crit_exp); 
++        
++        cost_params.exp_criticality = exp(device_ctx.M * pow(cost_params.criticality, device_ctx.edge_splitter_crit_exp)); 
++        //NOTE: We switched to exponential drop because it discriminates the critical net in a more gradual manner in the region where it is of interest.
++        //if (!device_ctx.is_reset_iter)
++        //   printf("%g -> %g\n", cost_params.criticality, cost_params.exp_criticality);
+ 
+         if (budgeting_inf.if_set()) {
+             conn_delay_budget.max_delay = budgeting_inf.get_max_delay_budget(net_id, target_pin);
+@@ -1450,6 +1630,8 @@
+     float new_total_cost = cheapest->cost;
+     float new_back_cost = cheapest->backward_path_cost;
+ 
++    //printf("Node %d: old = %g/%g, new = %g/%g\n", inode, old_total_cost, old_back_cost, new_total_cost, new_back_cost);
++
+     /* I only re-expand a node if both the "known" backward cost is lower  *
+      * in the new expansion (this is necessary to prevent loops from       *
+      * forming in the routing and causing havoc) *and* the expected total  *
+@@ -1493,12 +1675,17 @@
+ 
+     auto& route_ctx = g_vpr_ctx.routing();
+ 
++    //SN_TRETS: Added fetch device_ctx, for full ripup!
++    auto& device_ctx = g_vpr_ctx.device();
++
+     t_rt_node* rt_root;
+ 
+     // for nets below a certain size (min_incremental_reroute_fanout), rip up any old routing
+     // otherwise, we incrementally reroute by reusing legal parts of the previous iteration
+     // convert the previous iteration's traceback into the starting route tree for this iteration
+-    if ((int)num_sinks < min_incremental_reroute_fanout || itry == 1) {
++    //
++    //SN_TERETS: Added ripup_all in the condition!
++    if ((int)num_sinks < min_incremental_reroute_fanout || itry == 1 || device_ctx.ripup_all) {
+         profiling::net_rerouted();
+ 
+         // rip up the whole net
+@@ -1794,6 +1981,7 @@
+     int num_edges = device_ctx.rr_nodes[current->index].num_edges();
+     for (int iconn = 0; iconn < num_edges; iconn++) {
+         int to_node = device_ctx.rr_nodes[current->index].edge_sink_node(iconn);
++        //printf("Trying to expand %d to %d\n", current->index, to_node);
+         timing_driven_expand_neighbour(current,
+                                        current->index, iconn, to_node,
+                                        cost_params,
+@@ -1912,6 +2100,14 @@
+                                       router_lookahead,
+                                       from_node, to_node, iconn, target_node);
+ 
++    /*auto& device_ctx = g_vpr_ctx.device();
++    auto& node = device_ctx.rr_nodes[144064];
++    printf("%d\n", node.is_edge_splitter());
++    int cost_ind = node.cost_index();
++    printf("%g\n", device_ctx.rr_indexed_data[cost_ind].base_cost); 
++    auto& src = device_ctx.rr_nodes[3061];
++    printf("3061 -> %d\n", src.num_edges());*/
++
+     //Record how we reached this node
+     current->index = to_node;
+     current->u.prev.edge = iconn;
+@@ -1978,8 +2174,67 @@
+     }
+ 
+     //Update the backward cost (upstream already included)
+-    to->backward_path_cost += (1. - cost_params.criticality) * cong_cost; //Congestion cost
+-    to->backward_path_cost += cost_params.criticality * Tdel;             //Delay cost
++
++    auto& to_node_node = device_ctx.rr_nodes[to_node];
++
++    float total_cost_edge_split_inc = 0.0;
++    if (to_node_node.is_edge_splitter())
++    {
++        if (device_ctx.max_criticality <= 1e-3)
++        {
++            to->backward_path_cost += cong_cost;
++        }
++        else
++        {
++            //to->backward_path_cost += (device_ctx.M - cost_params.exp_criticality) * cong_cost;
++            to->backward_path_cost += cost_params.exp_criticality * cong_cost;
++        }
++        //float adoption_probability_scale = (device_ctx.is_reset_iter || (device_ctx.base_cost_scale >= 0.1))
++        //                                 ? 1.0 : cong_cost / device_ctx.base_cost_scale; 
++        //
++        to->backward_path_cost += Tdel;//adoption_probability_scale * Tdel; //We scale the delay by the adoption probability
++        // (normalized cost), because if a switch is adopted just for one net, it will actually delay the pattern.
++        // Otherwise, it will not, as it serves another purpose already. This will mitigate spread on the critical nets.
++        // Note that it is necessary not to scale for the no-avalanche settings (all 0 costs) as that would effectively
++        // disable timing optimization altogether.
++        //NOTE: We don't use criticality in the cost term, because we don't want to spread the 
++        //nets over uncongested nodes by this, but rather to concentrate them.
++
++        const int include_edge_split_lookahead = 1;
++        if(include_edge_split_lookahead)
++        {
++            int child_ind = to_node_node.edge_sink_node(0);
++            auto& child_node = device_ctx.rr_nodes[child_ind];
++            int child_cost_ind = child_node.cost_index();
++            float child_cong_cost = get_rr_cong_cost(child_ind); 
++            //float child_cong_cost = device_ctx.rr_indexed_data[child_cost_ind].base_cost;
++            
++            //total_cost_edge_split_inc += 2 * (1. - cost_params.criticality) * child_cong_cost;
++            total_cost_edge_split_inc += 2 * cost_params.exp_criticality * child_cong_cost;
++
++            //We multiply by 2 because the congestion on the edge-splitter is the same as on its child.
++            //The base cost will tend to 0, which will discourage congestion removal, so including its cost directly
++            //would not have the right effect. Remember: we want concentration on types, but not on instances.
++
++            int child_switch = device_ctx.rr_nodes[to_node].edge_switch(0);
++            float child_switch_Tdel = device_ctx.rr_switch_inf[child_switch].Tdel;
++            total_cost_edge_split_inc += cost_params.criticality * child_switch_Tdel;
++        }
++        //Lookahead starts to make sense only when the congestion cost rises a lot, by which time we are almost done in any case.
++        //It takes a lot of time to compute (1/5 of the total runtime, for the first iteration on (alu4, tseng, ex5p wafer).
++    }
++    else 
++    {
++        if (device_ctx.max_criticality <= 1e-3)
++        {
++            to->backward_path_cost += (1. - cost_params.criticality) * cong_cost; //Congestion cost
++        }
++        else
++        {
++            to->backward_path_cost += cost_params.exp_criticality * cong_cost; //Congestion cost
++        }
++        to->backward_path_cost += cost_params.criticality * Tdel;             //Delay cost
++    }
+ 
+     if (cost_params.bend_cost != 0.) {
+         t_rr_type from_type = device_ctx.rr_nodes[from_node].type();
+@@ -2005,7 +2260,8 @@
+ 
+     //Update total cost
+     float expected_cost = router_lookahead.get_expected_cost(to_node, target_node, cost_params, to->R_upstream);
+-    total_cost = to->backward_path_cost + cost_params.astar_fac * expected_cost;
++    total_cost = to->backward_path_cost + cost_params.astar_fac * expected_cost + total_cost_edge_split_inc;
++    //Because astar_fac is > 1.0, edge_splitter lookahead inc should go without it, because it is tight.
+ 
+     to->cost = total_cost;
+ }
+@@ -2022,6 +2278,9 @@
+     factor = sqrt(fanout);
+ 
+     for (index = CHANX_COST_INDEX_START; index < device_ctx.rr_indexed_data.size(); index++) {
++        int seg_index = device_ctx.rr_indexed_data[index].seg_index;
++        if (device_ctx.arch_seg_inf[seg_index].length == 0)
++            continue;
+         if (device_ctx.rr_indexed_data[index].T_quadratic > 0.) { /* pass transistor */
+             device_ctx.rr_indexed_data[index].base_cost = device_ctx.rr_indexed_data[index].saved_base_cost * factor;
+         } else {
+@@ -2075,6 +2334,12 @@
+     auto& route_ctx = g_vpr_ctx.routing();
+     auto& device_ctx = g_vpr_ctx.device();
+ 
++    if (device_ctx.ripup_all)
++        return true;
++
++    //if (device_ctx.freeze_avalanche && device_ctx.ripup_all)
++    //    return true;
++
+     t_trace* tptr = route_ctx.trace[net_id].head;
+ 
+     if (tptr == nullptr) {
+@@ -2114,6 +2379,8 @@
+     /* Early exit code for cases where it is obvious that a successful route will not be found
+      * Heuristic: If total wirelength used in first routing iteration is X% of total available wirelength, exit */
+ 
++    return false;
++
+     if (wirelength_info.used_wirelength_ratio() > router_opts.init_wirelength_abort_threshold) {
+         VTR_LOG("Wire length usage ratio %g exceeds limit of %g, fail routing.\n",
+                 wirelength_info.used_wirelength_ratio(),
+@@ -2329,15 +2596,18 @@
+     size_t overused_nodes = 0;
+     size_t total_overuse = 0;
+     size_t worst_overuse = 0;
++    size_t overused_node = 0;
+     for (size_t inode = 0; inode < device_ctx.rr_nodes.size(); inode++) {
+         int overuse = route_ctx.rr_node_route_inf[inode].occ() - device_ctx.rr_nodes[inode].capacity();
+         if (overuse > 0) {
+             overused_nodes += 1;
++            overused_node = inode;
+ 
+             total_overuse += overuse;
+             worst_overuse = std::max(worst_overuse, size_t(overuse));
+         }
+     }
++    printf("Overused RR-node: %d\n", overused_node);
+     return OveruseInfo(device_ctx.rr_nodes.size(), overused_nodes, total_overuse, worst_overuse);
+ }
+ 
+@@ -2355,6 +2625,7 @@
+     }
+ 
+     for (auto net_id : cluster_ctx.clb_nlist.nets()) {
++        //VTR_LOG("Computing WL for net %d\n", net_id);
+         if (!cluster_ctx.clb_nlist.net_is_ignored(net_id)
+             && cluster_ctx.clb_nlist.net_sinks(net_id).size() != 0) { /* Globals don't count. */
+             int bends, wirelength, segments;
+@@ -2708,6 +2979,9 @@
+                                                int itry_since_last_convergence,
+                                                std::shared_ptr<const SetupHoldTimingInfo> timing_info,
+                                                const RoutingMetrics& best_routing_metrics) {
++
++    return false; //SN: FIXME: You actually want to check nonzero switch utilization convergence (or some epsilon).
++
+     //Give-up on reconvergent routing if the CPD improvement after the
+     //first iteration since convergence is small, compared to the best
+     //CPD seen so far
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_timing.h vtr8_avalanche/vpr/src/route/route_timing.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_timing.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/route_timing.h	2022-11-30 23:03:50.632578000 +0100
+@@ -13,7 +13,7 @@
+ 
+ int get_max_pins_per_net();
+ 
+-bool try_timing_driven_route(const t_router_opts& router_opts,
++bool try_timing_driven_route(t_router_opts& router_opts,
+                              const t_analysis_opts& analysis_opts,
+                              vtr::vector<ClusterNetId, float*>& net_delay,
+                              const ClusteredPinAtomPinsLookup& netlist_pin_lookup,
+@@ -41,6 +41,7 @@
+ 
+ struct t_conn_cost_params {
+     float criticality = 1.;
++    float exp_criticality = 1.;
+     float astar_fac = 1.2;
+     float bend_cost = 1.;
+     const t_conn_delay_budget* delay_budget = nullptr;
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_tree_timing.h vtr8_avalanche/vpr/src/route/route_tree_timing.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/route_tree_timing.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/route_tree_timing.h	2022-11-30 23:03:50.664574000 +0100
+@@ -15,7 +15,7 @@
+ t_rt_node* init_route_tree_to_source(ClusterNetId inet);
+ 
+ void free_route_tree(t_rt_node* rt_node);
+-void print_route_tree(const t_rt_node* rt_node, int depth = 0);
++//void print_route_tree(const t_rt_node* rt_node, int depth = 0);
+ 
+ t_rt_node* update_route_tree(t_heap* hptr, SpatialRouteTreeLookup* spatial_rt_lookup);
+ 
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_graph.cpp vtr8_avalanche/vpr/src/route/rr_graph.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_graph.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/rr_graph.cpp	2022-11-30 23:03:50.782537000 +0100
+@@ -379,7 +379,11 @@
+     print_rr_graph_stats();
+ 
+     if (router_lookahead_type == e_router_lookahead::MAP) {
+-        compute_router_lookahead(segment_inf.size());
++        printf("Calling map lookahead.\n");
++        compute_router_lookahead(segment_inf.size(), segment_inf);
++        //printf("Computed the lookahead during rr-graph construction\n.");
++        //char tmp;
++        //scanf("%c", &tmp);
+     }
+ 
+     //Write out rr graph file if needed
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_graph_indexed_data.cpp vtr8_avalanche/vpr/src/route/rr_graph_indexed_data.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_graph_indexed_data.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/rr_graph_indexed_data.cpp	2022-11-30 23:03:50.839568000 +0100
+@@ -1,4 +1,4 @@
+-#include <cmath> /* Needed only for sqrt call (remove if sqrt removed) */
++#include <cmath> /* Needed only for sqrindex, t call (remove if sqrt removed) */
+ using namespace std;
+ 
+ #include "vtr_assert.h"
+@@ -20,6 +20,8 @@
+                                             const t_rr_node_indices& L_rr_node_indices,
+                                             enum e_base_cost_type base_cost_type);
+ 
++static void load_external_base_costs();
++
+ static float get_delay_normalization_fac(int nodes_per_chan,
+                                          const t_rr_node_indices& L_rr_node_indices);
+ 
+@@ -88,7 +90,11 @@
+         else
+             length = std::min<int>(segment_inf[iseg].length, device_ctx.grid.width());
+ 
+-        device_ctx.rr_indexed_data[index].inv_length = 1. / length;
++        if (length == 0)
++            device_ctx.rr_indexed_data[index].inv_length = 0.;
++            //SN: Check if it should be set to 0 or some other number, for these zero-length wires.
++        else
++            device_ctx.rr_indexed_data[index].inv_length = 1. / length;
+         device_ctx.rr_indexed_data[index].seg_index = iseg;
+     }
+     load_rr_indexed_data_T_values(CHANX_COST_INDEX_START, num_segment, CHANX,
+@@ -109,14 +115,20 @@
+         else
+             length = std::min<int>(segment_inf[iseg].length, device_ctx.grid.height());
+ 
+-        device_ctx.rr_indexed_data[index].inv_length = 1. / length;
++        if (length == 0)
++            device_ctx.rr_indexed_data[index].inv_length = 0.;
++            //SN: Check if it should be set to 0 or some other number, for these zero-length wires.
++        else
++            device_ctx.rr_indexed_data[index].inv_length = 1. / length;
+         device_ctx.rr_indexed_data[index].seg_index = iseg;
+     }
+     load_rr_indexed_data_T_values((CHANX_COST_INDEX_START + num_segment),
+                                   num_segment, CHANY, nodes_per_chan, L_rr_node_indices);
+ 
++    printf("Loading base costs.\n");
+     load_rr_indexed_data_base_costs(nodes_per_chan, L_rr_node_indices,
+                                     base_cost_type);
++    printf("All loading done.\n");
+ }
+ 
+ void load_rr_index_segments(const int num_segment) {
+@@ -176,6 +188,7 @@
+ 
+         } else if (base_cost_type == DELAY_NORMALIZED_LENGTH || base_cost_type == DEMAND_ONLY_NORMALIZED_LENGTH) {
+             device_ctx.rr_indexed_data[index].base_cost = delay_normalization_fac / device_ctx.rr_indexed_data[index].inv_length;
++            //printf("index %d = %g\n", index, device_ctx.rr_indexed_data[index].base_cost);
+ 
+         } else if (base_cost_type == DELAY_NORMALIZED_FREQUENCY) {
+             int seg_index = device_ctx.rr_indexed_data[index].seg_index;
+@@ -205,6 +218,69 @@
+     for (index = 0; index < device_ctx.rr_indexed_data.size(); index++) {
+         device_ctx.rr_indexed_data[index].saved_base_cost = device_ctx.rr_indexed_data[index].base_cost;
+     }
++   
++    printf("Loading external costs.\n"); 
++    load_external_base_costs();
++    printf("External costs loaded.\n");
++
++    /*for (index = CHANX_COST_INDEX_START; index < device_ctx.rr_indexed_data.size(); index++) {
++        if (base_cost_type == DELAY_NORMALIZED || base_cost_type == DEMAND_ONLY) {
++            device_ctx.rr_indexed_data[index].base_cost = delay_normalization_fac;
++
++        } else if (base_cost_type == DELAY_NORMALIZED_LENGTH || base_cost_type == DEMAND_ONLY_NORMALIZED_LENGTH) {
++            printf("index %d = %g\n", index, device_ctx.rr_indexed_data[index].base_cost);
++        }
++    }*/
++    //printf("Loading done.\n");
++}
++
++//SN: A function to load external base costs, used to initialize the avalanche process.
++static void load_external_base_costs()
++{
++    auto& device_ctx = g_vpr_ctx.mutable_device();
++    FILE* f = vtr::fopen("base_costs.dump", "r");
++    VTR_ASSERT(f != NULL);
++
++    fscanf(f, "%f %f %f %d %f %f", &(device_ctx.avalanche_p), &(device_ctx.avalanche_h),
++                                &(device_ctx.avalanche_d), &(device_ctx.avalanche_iter_to_zero),
++                                &(device_ctx.reset_cost), &(device_ctx.wire_lookahead_weight));
++
++    fscanf(f, "%f %f", &(device_ctx.edge_splitter_crit_exp), &(device_ctx.target_critical_splitter_cost));
++
++    unsigned potential_edge_count = -1;
++    int scaling_factor_exponent = 0;
++    float scaling_factor = 0;
++    fscanf(f, "%u %d", &potential_edge_count, &scaling_factor_exponent);
++    device_ctx.lookahead_boost_factor = (float)(pow(10, -1 * scaling_factor_exponent)); 
++    scaling_factor = (float)(pow(10, scaling_factor_exponent));
++    device_ctx.base_cost_scale = scaling_factor; 
++
++    device_ctx.target_critical_splitter_cost *= scaling_factor;
++    device_ctx.wire_lookahead_weight *= scaling_factor;
++
++    unsigned y_wires_start = device_ctx.num_arch_segs;
++    //We already have the CHANX_START embedded in the external cost indices.
++    
++    for (unsigned i = 0; i < potential_edge_count; ++i)
++    {
++        int ind = -1;
++        float val = 0;
++        fscanf(f, "%d", &ind);
++        fscanf(f, "%f", &val);
++        //printf("%d %g\n", ind, val * scaling_factor);
++        device_ctx.rr_indexed_data[ind].base_cost = val * scaling_factor;
++        device_ctx.rr_indexed_data[ind].saved_base_cost = device_ctx.rr_indexed_data[ind].base_cost;
++        device_ctx.rr_indexed_data[ind + y_wires_start].base_cost = val * scaling_factor;
++        device_ctx.rr_indexed_data[ind + y_wires_start].saved_base_cost = device_ctx.rr_indexed_data[ind].base_cost;
++
++    }
++
++    device_ctx.avalanche_p *= scaling_factor;
++    device_ctx.avalanche_h *= scaling_factor;
++    device_ctx.avalanche_d *= scaling_factor;
++    device_ctx.reset_cost *= scaling_factor;
++ 
++    fclose(f);
+ }
+ 
+ static std::vector<size_t> count_rr_segment_types() {
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_graph_reader.cpp vtr8_avalanche/vpr/src/route/rr_graph_reader.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_graph_reader.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/rr_graph_reader.cpp	2022-11-30 23:03:50.971534000 +0100
+@@ -93,6 +93,7 @@
+         loc_data = pugiutil::load_xml(doc, read_rr_graph_name);
+ 
+         auto& device_ctx = g_vpr_ctx.mutable_device();
++        device_ctx.has_potential_switches = 0;
+ 
+         auto rr_graph = get_single_child(doc, "rr_graph", loc_data);
+ 
+@@ -138,6 +139,7 @@
+ 
+         /* Global routing uses a single longwire track */
+         int max_chan_width = (is_global_graph ? 1 : nodes_per_chan.max);
++        //printf("max_chan_width = %d\n", max_chan_width);
+         VTR_ASSERT(max_chan_width > 0);
+ 
+         /* Alloc rr nodes and count count nodes */
+@@ -167,6 +169,16 @@
+ 
+         init_fan_in(device_ctx.rr_nodes, device_ctx.rr_nodes.size());
+ 
++        //SN: Copy segment info to the global context.
++        printf("Copying segment information to the global context.\n");
++        device_ctx.num_arch_segs = segment_inf.size();
++        device_ctx.arch_seg_inf = new t_segment_inf[segment_inf.size()];
++        for (int iseg = 0; iseg < segment_inf.size(); ++iseg)
++        {
++            device_ctx.arch_seg_inf[iseg] = segment_inf[iseg];
++        }
++
++        printf("Copied. Allocating indexed_data.\n");
+         //sets the cost index and seg id information
+         next_component = get_single_child(rr_graph, "rr_nodes", loc_data);
+         set_cost_indices(next_component, loc_data, is_global_graph, segment_inf.size());
+@@ -174,10 +186,12 @@
+         alloc_and_load_rr_indexed_data(segment_inf, device_ctx.rr_node_indices,
+                                        max_chan_width, *wire_to_rr_ipin_switch, base_cost_type);
+ 
++        printf("Processing segment ids.\n");
+         process_seg_id(next_component, loc_data);
+ 
+         device_ctx.chan_width = nodes_per_chan;
+ 
++        //printf("Checking rr_graph\n");
+         check_rr_graph(graph_type, grid, device_ctx.block_types);
+ 
+     } catch (XmlError& e) {
+@@ -270,6 +284,16 @@
+             if (attribute) {
+                 int seg_id = get_attribute(segmentSubnode, "segment_id", loc_data).as_int(0);
+                 device_ctx.rr_indexed_data[node.cost_index()].seg_index = seg_id;
++                int length = device_ctx.arch_seg_inf[seg_id].length;
++                if (length == 0)
++                {
++                    node.set_is_edge_splitter(true);
++                    device_ctx.has_potential_switches = 1;
++                }
++                else
++                {
++                    node.set_is_edge_splitter(false);
++                }
+             } else {
+                 //-1 for non chanx or chany nodes
+                 device_ctx.rr_indexed_data[node.cost_index()].seg_index = -1;
+@@ -782,6 +806,12 @@
+     /* CHANX and CHANY need to reevaluated with its ptc num as the correct index*/
+     for (size_t inode = 0; inode < device_ctx.rr_nodes.size(); inode++) {
+         auto& node = device_ctx.rr_nodes[inode];
++        //SN_DEBUG: if (inode == 708887)
++        //{
++        //    printf("ptc(708887) = %d\n", node.ptc_num());
++        //    exit(0);
++        //}
++         
+         if (node.type() == CHANX) {
+             for (int iy = node.ylow(); iy <= node.yhigh(); iy++) {
+                 for (int ix = node.xlow(); ix <= node.xhigh(); ix++) {
+@@ -804,6 +834,7 @@
+                                   count, ix, iy, indices[CHANY][ix][iy][0].size());
+                     }
+                     indices[CHANY][ix][iy][0][count] = inode;
++                    //printf("ix = %d, iy = %d, count = %d, inode = %d\n", ix, iy, count, inode);
+                 }
+             }
+         }
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_node.cpp vtr8_avalanche/vpr/src/route/rr_node.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_node.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/rr_node.cpp	2022-11-30 23:03:50.932537000 +0100
+@@ -6,6 +6,11 @@
+  * resource type string by its index, which is defined by           *
+  * "t_rr_type type".												*/
+ 
++bool t_rr_node::is_edge_splitter() const
++{
++    return is_edge_splitter_;
++}
++
+ const char* t_rr_node::type_string() const {
+     return rr_node_typename[type()];
+ }
+@@ -51,11 +56,11 @@
+     return ptc_.class_num;
+ }
+ 
+-short t_rr_node::cost_index() const {
++int t_rr_node::cost_index() const {
+     return cost_index_;
+ }
+ 
+-short t_rr_node::rc_index() const {
++int t_rr_node::rc_index() const {
+     return rc_index_;
+ }
+ 
+@@ -149,6 +154,11 @@
+     return true;
+ }
+ 
++void t_rr_node::set_is_edge_splitter(bool is_edge_splitter)
++{
++    is_edge_splitter_ = is_edge_splitter;
++}
++
+ void t_rr_node::set_type(t_rr_type new_type) {
+     type_ = new_type;
+ }
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_node.h vtr8_avalanche/vpr/src/route/rr_node.h
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/rr_node.h	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/rr_node.h	2022-11-30 23:03:50.937527000 +0100
+@@ -101,6 +101,8 @@
+     short yhigh() const;
+     signed short length() const;
+ 
++    bool is_edge_splitter() const; //SN: Indicates a zero-length edge-splitting node.
++
+     short capacity() const;
+ 
+     short ptc_num() const;
+@@ -108,8 +110,8 @@
+     short track_num() const; //Same as ptc_num() but checks that type() is consistent
+     short class_num() const; //Same as ptc_num() but checks that type() is consistent
+ 
+-    short cost_index() const;
+-    short rc_index() const;
++    int cost_index() const;
++    int rc_index() const;
+     e_direction direction() const;
+     const char* direction_string() const;
+ 
+@@ -144,6 +146,8 @@
+ 
+     void set_coordinates(short x1, short y1, short x2, short y2);
+ 
++    void set_is_edge_splitter(bool is_edge_splitter);
++
+     void set_capacity(short);
+ 
+     void set_ptc_num(short);
+@@ -173,7 +177,7 @@
+     uint16_t edges_capacity_ = 0;
+     uint8_t num_non_configurable_edges_ = 0;
+ 
+-    int8_t cost_index_ = -1;
++    int32_t cost_index_ = -1;
+     int16_t rc_index_ = -1;
+ 
+     int16_t xlow_ = -1;
+@@ -181,6 +185,8 @@
+     int16_t xhigh_ = -1;
+     int16_t yhigh_ = -1;
+ 
++    bool is_edge_splitter_ = false;
++
+     t_rr_type type_ = NUM_RR_TYPES;
+     union {
+         e_direction direction; //Valid only for CHANX/CHANY
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/segment_stats.cpp vtr8_avalanche/vpr/src/route/segment_stats.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/route/segment_stats.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/route/segment_stats.cpp	2022-11-30 23:03:50.950566000 +0100
+@@ -8,6 +8,8 @@
+ #include "globals.h"
+ #include "segment_stats.h"
+ 
++#include "route_common.h"
++
+ /*************** Variables and defines local to this module ****************/
+ 
+ #define LONGLINE 0
+@@ -61,6 +63,8 @@
+         }
+     }
+ 
++    print_edge_splitter_costs();
++
+     VTR_LOG("\n");
+     VTR_LOG("Segment usage by type (index): type utilization\n");
+     VTR_LOG("                               ---- -----------\n");
+diff -ruN '--exclude=.git*' '--exclude=vtr_flow' vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/timing/read_sdc.cpp vtr8_avalanche/vpr/src/timing/read_sdc.cpp
+--- vanilla_vpr/vtr-verilog-to-routing-8.0.0/vpr/src/timing/read_sdc.cpp	2020-03-24 17:02:30.000000000 +0100
++++ vtr8_avalanche/vpr/src/timing/read_sdc.cpp	2022-11-30 23:03:51.230550000 +0100
+@@ -470,6 +470,14 @@
+         //Disable any edges between the from and to sets
+         for (auto from_pin : from_pins) {
+             for (auto to_pin : from_pins) {
++                //DEBUG{
++                /*const auto& from_pin_name = netlist_.pin_name(from_pin);
++                const auto& to_pin_name = netlist_.pin_name(to_pin);
++
++                printf("%s, %s\n", from_pin_name.c_str(), to_pin_name.c_str());
++                continue;*/
++                //DEBUG}
++
+                 tatum::NodeId from_tnode = lookup_.atom_pin_tnode(from_pin);
+                 VTR_ASSERT(from_tnode);
+ 

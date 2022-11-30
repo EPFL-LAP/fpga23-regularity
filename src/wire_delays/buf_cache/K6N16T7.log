@@ -1,0 +1,9 @@
+Maximum length = 2
+Buffer sizes per length:
+1: 4 12
+2: 5 20
+4: 4 20
+Delays per length:
+1: 22.98 ps
+2: 39.68 ps
+4: 97.14 ps
