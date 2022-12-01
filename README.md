@@ -14,7 +14,7 @@ However, with some slight modifications of the setenv.py files, this can be avoi
 
 ## Setting up VPR (Testing)
 
-In principle, postrouting results of testing the obtained architectures should not depend on the unused modifications of VPR. However, we have observed some slight variation between the build used for exploration (allows net order shuffling) and testing (does not allow net order shuffling). For exact reproduction of the results from the submitted version of the paper, we also provide a patch describing all the changes made to VPR in the test version. These can be found in [vpr/testing](https://github.com/EPFL-LAP/fpga23-regularity/blob/main/vpr/testing).
+In principle, postrouting results of testing the obtained architectures should not depend on the unused modifications of VPR. However, we have observed some slight variation (< 0.2%) between the build used for exploration (allows net order shuffling) and testing (does not allow net order shuffling). For exact reproduction of the results from the submitted version of the paper, we also provide a patch describing all the changes made to VPR in the test version. These can be found in [vpr/testing](https://github.com/EPFL-LAP/fpga23-regularity/blob/main/vpr/testing).
 
 ## Configuring Paths
 
@@ -42,7 +42,7 @@ At the end of the process, plots from the paper should appear in the figs/ direc
 
 ## Using the Switch-Block Exploration Scripts
 
-Using the scripts for performing an exploration other than the ones set up by run_exploration.py is achieved by navigating to src/generate_architectur/ and running the explore_avalanche.py script as described in [EPFL-LAP/fpl21-avalanche](https://github.com/EPFL-LAP/fpl21-avalanche). Constraint specification is done through the [config.py](https://github.com/EPFL-LAP/fpga23-regularity/blob/main/src/generate_architecture/config.py) file. Support for new constraint types can be added by modifying the [ilp_setup.py](https://github.com/EPFL-LAP/fpga23-regularity/blob/main/src/generate_architecture/ilp_setup.py) file. 
+Using the scripts for performing an exploration other than the ones set up by run_exploration.py is achieved by navigating to src/generate_architecture/ and running the explore_avalanche.py script as described in [EPFL-LAP/fpl21-avalanche](https://github.com/EPFL-LAP/fpl21-avalanche). Constraint specification is done through the [config.py](https://github.com/EPFL-LAP/fpga23-regularity/blob/main/src/generate_architecture/config.py) file. Support for new constraint types can be added by modifying the [ilp_setup.py](https://github.com/EPFL-LAP/fpga23-regularity/blob/main/src/generate_architecture/ilp_setup.py) file. 
 
 ## Contact
 
