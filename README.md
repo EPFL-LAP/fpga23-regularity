@@ -1,5 +1,7 @@
 # Regularity Matters: Designing Practical FPGA Switch-Blocks
 
+[![DOI](https://zenodo.org/badge/555379726.svg)](https://zenodo.org/badge/latestdoi/555379726)
+
 This repository holds the source code of the regular FPGA switch-block pattern exploration tool presented in the paper entitled "Regularity Matters: Designing Practical FPGA Switch-Blocks".
 It is an extension of the ["Turning PathFinder Upside-Down: Exploring FPGA Switch-Blocks by Negotiating Switch Presence"](https://github.com/EPFL-LAP/fpl21-avalanche) paper.
 The main difference is the addition of an ILP generator which models the various types of regularity constraints that have been explored. It can be found in [ilp_setup.py](https://github.com/EPFL-LAP/fpga23-regularity/blob/main/src/generate_architecture/ilp_setup.py).
